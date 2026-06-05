@@ -1,6 +1,24 @@
 let
-    fn_處理權證資料 = (SourceTable as table) as table =>
+    fn_處理權證資料 = (optional SourceTable as nullable table) as table =>
     let
+        // 若未傳入表格，直接從 D:\warant 載入最後修改時間最新的 CSV。
+        SourceTableResolved =
+            if SourceTable <> null then
+                SourceTable
+            else
+                let
+                    CsvFiles = Table.SelectRows(
+                        Folder.Files("D:\warant"),
+                        each Text.Lower([Extension]) = ".csv" and not Text.StartsWith([Name], "~$")
+                    ),
+                    SortedCsvFiles = Table.Sort(CsvFiles, {{"Date modified", Order.Descending}, {"Name", Order.Descending}}),
+                    LatestCsv = if Table.RowCount(SortedCsvFiles) = 0 then error "在 D:\warant 找不到 CSV 檔。" else SortedCsvFiles{0},
+                    ImportedCsv = Csv.Document(LatestCsv[Content], [Delimiter = ",", Columns = 18, Encoding = 65001, QuoteStyle = QuoteStyle.Csv])
+                in
+                    ImportedCsv,
+
+        CleanText = (value) => if value = null then "" else Text.Clean(Text.Trim(Text.From(value))),
+
         // 0. 定義民國年轉日期函數
         fn_民國轉日期 = (datestr) => 
             if datestr = null or datestr = "" then null else
@@ -15,24 +33,25 @@ let
                 DateVal,
 
         // 1. 自動定位標頭 (強健版：自動尋找含有「權證代號」的列)
-        CheckHeader = if List.Contains(Table.ColumnNames(SourceTable), "權證代號") then SourceTable 
+        CheckHeader = if List.Contains(Table.ColumnNames(SourceTableResolved), "權證代號") then SourceTableResolved 
                       else 
                         let
                             // 搜尋前 10 列，找出哪一列包含 "權證代號"
-                            HeaderSearch = Table.FirstN(SourceTable, 10),
+                            HeaderSearch = Table.FirstN(SourceTableResolved, 10),
                             Rows = Table.ToRows(HeaderSearch),
                             HeaderPos = List.PositionOf(
-                                List.Transform(Rows, (r) => List.Contains(r, "權證代號") or List.Contains(r, "=""權證代號""")), 
+                                List.Transform(Rows, (r) => List.AnyTrue(List.Transform(r, each Text.Contains(CleanText(_), "權證代號")))),
                                 true
                             ),
                             // 如果找不到，預設不跳過；如果找到了，跳過該列之前的列並提升標頭
-                            ActualSkip = if HeaderPos = -1 then 0 else HeaderPos,
-                            Promoted = Table.PromoteHeaders(Table.Skip(SourceTable, ActualSkip))
+                            ActualSkip = if HeaderPos = -1 then error "找不到含有「權證代號」的表頭列。" else HeaderPos,
+                            Promoted = Table.PromoteHeaders(Table.Skip(SourceTableResolved, ActualSkip), [PromoteAllScalars = true])
                         in
                             Promoted,
+        CleanHeaderNames = Table.TransformColumnNames(CheckHeader, each CleanText(_)),
 
         // 2. 清理數值與移除逗號 (增加更多容錯)
-        CleanNumbers = Table.TransformColumns(CheckHeader, {
+        CleanNumbers = Table.TransformColumns(CleanHeaderNames, {
             {"收盤價", each if _ is text then Number.From(Text.Replace(Text.Replace(_, ",", ""), "－", "0")) else _, type number},
             {"收盤價/指數", each if _ is text then Number.From(Text.Replace(Text.Replace(_, ",", ""), "－", "0")) else _, type number},
             {"履約價格(元)/點數", each if _ is text then Number.From(Text.Replace(Text.Replace(_, ",", ""), "－", "0")) else _, type number},
@@ -73,16 +92,13 @@ let
         AddMoneyness = Table.AddColumn(Step6_Issuer, "價內/價外", each 
             let S = [#"收盤價/指數"], K = [#"履約價格(元)/點數"], T = [權證類型] in 
             if K = 0 or K = null then null else if T = "認購" then (S/K)-1 else if T = "認售" then 1-(S/K) else null, type number),
-        
-        // 剩餘天數
+
         AddRemainingDays = Table.AddColumn(AddMoneyness, "剩餘天數", each 
             if [履約截止日] = null then null else Duration.Days([履約截止日] - Date.From(DateTime.LocalNow())), Int64.Type),
 
-        // 槓桿倍數 (無Delta時先作為有效槓桿)
         AddLeverage = Table.AddColumn(AddRemainingDays, "有效槓桿", each 
             if [收盤價] > 0 then ([#"收盤價/指數"] * [行使比例]) / [收盤價] else null, type number),
 
-        
         AddSubjectType = Table.AddColumn(AddLeverage, "標的類別", each 
             if Text.StartsWith([標的代號], "IX") or [標的名稱] = "臺股指數" then "指數" else "個股", type text),
 

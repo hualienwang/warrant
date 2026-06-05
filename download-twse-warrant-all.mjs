@@ -15,12 +15,16 @@
  *  - 默认：node download-twse-warrant-all.mjs
  *    → 产出文件：warrant-all-<YYYYMMDD>.csv
  *  - 自定义输出：node download-twse-warrant-all.mjs myfile.csv
+ *  - 一次性处理：node download-twse-warrant-all.mjs --refresh-excel
+ *    → 下载 CSV 后，刷新同目录的 Excel權證處理.xlsx
+ *  - 指定活页簿：node download-twse-warrant-all.mjs --refresh-excel other.xlsx
  */
 
 // ============ 第一部分：导入 Node.js 内置模块 ============
 
 // 文件操作：writeFile 用来写入文件内容到磁盘
 import { writeFile, rename, unlink, mkdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 
 // 路径处理：处理文件路径、目录名等
 import { dirname, join, resolve } from 'node:path';
@@ -50,6 +54,8 @@ const FETCH_TIMEOUT_MS = 10000; // 10 秒
 
 // 重试延迟基底（毫秒），实际延迟会乘以尝试次数
 const RETRY_DELAY_MS = 3000;
+
+const DEFAULT_WORKBOOK_FILE = join(SCRIPT_DIR, 'Excel權證處理.xlsx');
 
 // ============ 第三部分：工具函数（功能模块） ============
 
@@ -81,12 +87,59 @@ function taiwanDateStamp(date = new Date()) {
  * 输出：完整的文件路径
  * 用途：允许用户自定义输出文件名，或使用默认名称
  */
+function parseArgs(argv = process.argv.slice(2)) {
+  const options = {
+    output: null,
+    refreshExcel: false,
+    workbook: DEFAULT_WORKBOOK_FILE,
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (arg === '--refresh-excel') {
+      options.refreshExcel = true;
+      const next = argv[index + 1];
+      if (next && !next.startsWith('--') && !/\.csv$/i.test(next)) {
+        options.workbook = resolve(SCRIPT_DIR, next);
+        index += 1;
+      }
+      continue;
+    }
+
+    if (arg === '--workbook') {
+      const next = argv[index + 1];
+      if (!next) {
+        throw new Error('Missing workbook path after --workbook');
+      }
+      options.workbook = resolve(SCRIPT_DIR, next);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+
+    if (!options.output) {
+      options.output = arg;
+      continue;
+    }
+
+    throw new Error(`Unexpected argument: ${arg}`);
+  }
+
+  return options;
+}
+
+const OPTIONS = parseArgs();
+
 function outputPathFromArgs() {
   // 默认文件名：warrant-all-日期.csv（例如 warrant-all-20260530.csv）
   const fallback = `warrant-all-${taiwanDateStamp()}.csv`;
   
   // 如果用户提供了第二个参数，就用用户的；否则使用默认值
-  let requested = process.argv[2] || fallback;
+  let requested = OPTIONS.output || fallback;
   // 确保扩展名为 .csv
   if (!/\.csv$/i.test(requested)) {
     requested = `${requested}.csv`;
@@ -170,6 +223,130 @@ async function ensureDirectoryExists(filePath) {
     // 如果创建目录失败，抛出错误
     throw new Error(`Failed to create directory ${dir}: ${err && err.message ? err.message : err}`);
   }
+}
+
+function execFileAsync(file, args, options = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(file, args, options, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        rejectPromise(error);
+        return;
+      }
+      resolvePromise({ stdout, stderr });
+    });
+  });
+}
+
+async function refreshExcelWorkbook(workbookPath) {
+  if (process.platform !== 'win32') {
+    throw new Error('Excel refresh requires Windows with desktop Excel installed.');
+  }
+
+  const escapedWorkbookPath = workbookPath.replace(/'/g, "''");
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$workbookPath = '${escapedWorkbookPath}'
+$excel = $null
+$workbook = $null
+
+try {
+  function Invoke-ComRetry {
+    param(
+      [string]$Description,
+      [scriptblock]$Action,
+      [int]$Attempts = 60,
+      [int]$DelayMilliseconds = 1000
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt += 1) {
+      try {
+        return & $Action
+      }
+      catch {
+        if ($attempt -ge $Attempts) {
+          throw
+        }
+        Write-Output "[Excel] $Description is busy; retry $attempt/$Attempts..."
+        Start-Sleep -Milliseconds $DelayMilliseconds
+      }
+    }
+  }
+
+  Write-Output "[Excel] resolving workbook path..."
+  $resolvedWorkbookPath = (Resolve-Path -LiteralPath $workbookPath).Path
+  try {
+    $lockTest = [System.IO.File]::Open($resolvedWorkbookPath, 'Open', 'ReadWrite', 'None')
+    $lockTest.Close()
+  }
+  catch {
+    throw "Workbook is locked. Close Excel權證處理.xlsx and any hidden EXCEL.EXE processes, then run again. Path: $resolvedWorkbookPath"
+  }
+
+  Write-Output "[Excel] starting Excel..."
+  $excel = Invoke-ComRetry "start Excel" { New-Object -ComObject Excel.Application } 10 1000
+  $excel.Visible = $false
+  $excel.DisplayAlerts = $false
+  $excel.AskToUpdateLinks = $false
+  $excel.EnableEvents = $false
+
+  Write-Output "[Excel] opening workbook: $resolvedWorkbookPath"
+  $workbook = Invoke-ComRetry "open workbook" { $excel.Workbooks.Open($resolvedWorkbookPath) } 30 1000
+
+  Write-Output "[Excel] disabling background refresh..."
+  foreach ($connection in $workbook.Connections) {
+    try { $connection.OLEDBConnection.BackgroundQuery = $false } catch {}
+    try { $connection.ODBCConnection.BackgroundQuery = $false } catch {}
+  }
+
+  foreach ($worksheet in $workbook.Worksheets) {
+    foreach ($queryTable in $worksheet.QueryTables) {
+      try { $queryTable.BackgroundQuery = $false } catch {}
+    }
+    foreach ($listObject in $worksheet.ListObjects) {
+      try { $listObject.QueryTable.BackgroundQuery = $false } catch {}
+    }
+  }
+
+  Write-Output "[Excel] refreshing queries..."
+  Invoke-ComRetry "refresh queries" { $workbook.RefreshAll() } 30 1000 | Out-Null
+  Write-Output "[Excel] waiting 30 seconds for query refresh..."
+  Start-Sleep -Seconds 30
+  for ($attempt = 1; $attempt -le 30; $attempt += 1) {
+    try {
+      if ($excel.Ready) {
+        break
+      }
+    }
+    catch {}
+    Write-Output "[Excel] Excel is still busy; wait $attempt/30..."
+    Start-Sleep -Seconds 1
+  }
+  Write-Output "[Excel] saving workbook..."
+  Invoke-ComRetry "save workbook" { $workbook.Save() } 30 1000 | Out-Null
+  Write-Output "Excel refreshed and saved: $resolvedWorkbookPath"
+}
+finally {
+  if ($workbook -ne $null) {
+    try { $workbook.Close($true) } catch {}
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null
+  }
+  if ($excel -ne $null) {
+    try { $excel.Quit() } catch {}
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
+  }
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
+}
+`;
+
+  const powershell = 'powershell.exe';
+  return execFileAsync(
+    powershell,
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    { windowsHide: true, timeout: 5 * 60 * 1000 },
+  );
 }
 
 
@@ -334,6 +511,17 @@ async function main() {
     csvLines: csvRows.length,       // CSV 总共有多少行（包括标题）
     encoding: 'UTF-8 with BOM',     // 编码方式
   }, null, 2));
+
+  if (OPTIONS.refreshExcel) {
+    console.error(`Refreshing Excel workbook: ${OPTIONS.workbook}`);
+    const { stdout, stderr } = await refreshExcelWorkbook(OPTIONS.workbook);
+    if (stderr) {
+      console.error(stderr.trim());
+    }
+    if (stdout) {
+      console.error(stdout.trim());
+    }
+  }
 }
 
 // ===== 步骤 8：执行主程序（处理错误） =====
