@@ -2,7 +2,9 @@ let
     // 每次重新整理時，從 D:\warant 找最後修改時間最新的 CSV。
     CsvFiles = Table.SelectRows(
         Folder.Files("D:\warant"),
-        each Text.Lower([Extension]) = ".csv" and not Text.StartsWith([Name], "~$")
+        each Text.Lower([Extension]) = ".csv"
+            and Text.StartsWith([Name], "warrant-all-")
+            and not Text.StartsWith([Name], "~$")
     ),
     SortedCsvFiles = Table.Sort(CsvFiles, {{"Date modified", Order.Descending}, {"Name", Order.Descending}}),
     LatestCsv = if Table.RowCount(SortedCsvFiles) = 0 then error "在 D:\warant 找不到 CSV 檔。" else SortedCsvFiles{0},
