@@ -39,7 +39,7 @@ if errorlevel 1 (
 
 echo [%date% %time%] Done. >> "%LOG%"
 echo.
-echo Done: downloaded latest stock CSV. Open Excel股票處理.xlsx to refresh.
+echo Done: downloaded latest stock CSV and refreshed Excel股票處理.xlsx.
 echo.
 echo Log file:
 echo %LOG%

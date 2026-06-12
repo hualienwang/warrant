@@ -1,4 +1,5 @@
 import { writeFile, rename, unlink, mkdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -9,6 +10,7 @@ const UTF8_BOM = '\uFEFF';
 const MAX_ATTEMPTS = 3;
 const FETCH_TIMEOUT_MS = 30000;
 const RETRY_DELAY_MS = 3000;
+const DEFAULT_WORKBOOK_FILE = join(SCRIPT_DIR, 'Excel股票處理.xlsx');
 
 function taiwanDateStamp(date = new Date()) {
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -21,9 +23,56 @@ function taiwanDateStamp(date = new Date()) {
   return `${values.year}${values.month}${values.day}`;
 }
 
+function parseArgs(argv = process.argv.slice(2)) {
+  const options = {
+    output: null,
+    refreshExcel: false,
+    workbook: DEFAULT_WORKBOOK_FILE,
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+
+    if (arg === '--refresh-excel') {
+      options.refreshExcel = true;
+      const next = argv[index + 1];
+      if (next && !next.startsWith('--') && !/\.csv$/i.test(next)) {
+        options.workbook = resolve(SCRIPT_DIR, next);
+        index += 1;
+      }
+      continue;
+    }
+
+    if (arg === '--workbook') {
+      const next = argv[index + 1];
+      if (!next) {
+        throw new Error('Missing workbook path after --workbook');
+      }
+      options.workbook = resolve(SCRIPT_DIR, next);
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+
+    if (!options.output) {
+      options.output = arg;
+      continue;
+    }
+
+    throw new Error(`Unexpected argument: ${arg}`);
+  }
+
+  return options;
+}
+
+const OPTIONS = parseArgs();
+
 function outputPathFromArgs() {
   const fallback = `twse-stocks-${taiwanDateStamp()}.csv`;
-  let requested = process.argv[2] || fallback;
+  let requested = OPTIONS.output || fallback;
   if (!/\.csv$/i.test(requested)) {
     requested = `${requested}.csv`;
   }
@@ -60,6 +109,130 @@ async function ensureDirectoryExists(filePath) {
   } catch (err) {
     throw new Error(`Failed to create directory ${dir}: ${err && err.message ? err.message : err}`);
   }
+}
+
+function execFileAsync(file, args, options = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFile(file, args, options, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        rejectPromise(error);
+        return;
+      }
+      resolvePromise({ stdout, stderr });
+    });
+  });
+}
+
+async function refreshExcelWorkbook(workbookPath) {
+  if (process.platform !== 'win32') {
+    throw new Error('Excel refresh requires Windows with desktop Excel installed.');
+  }
+
+  const escapedWorkbookPath = workbookPath.replace(/'/g, "''");
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$workbookPath = '${escapedWorkbookPath}'
+$excel = $null
+$workbook = $null
+
+try {
+  function Invoke-ComRetry {
+    param(
+      [string]$Description,
+      [scriptblock]$Action,
+      [int]$Attempts = 60,
+      [int]$DelayMilliseconds = 1000
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt += 1) {
+      try {
+        return & $Action
+      }
+      catch {
+        if ($attempt -ge $Attempts) {
+          throw
+        }
+        Write-Output "[Excel] $Description is busy; retry $attempt/$Attempts..."
+        Start-Sleep -Milliseconds $DelayMilliseconds
+      }
+    }
+  }
+
+  Write-Output "[Excel] resolving workbook path..."
+  $resolvedWorkbookPath = (Resolve-Path -LiteralPath $workbookPath).Path
+  try {
+    $lockTest = [System.IO.File]::Open($resolvedWorkbookPath, 'Open', 'ReadWrite', 'None')
+    $lockTest.Close()
+  }
+  catch {
+    throw "Workbook is locked. Close Excel股票處理.xlsx and any hidden EXCEL.EXE processes, then run again. Path: $resolvedWorkbookPath"
+  }
+
+  Write-Output "[Excel] starting Excel..."
+  $excel = Invoke-ComRetry "start Excel" { New-Object -ComObject Excel.Application } 10 1000
+  $excel.Visible = $false
+  $excel.DisplayAlerts = $false
+  $excel.AskToUpdateLinks = $false
+  $excel.EnableEvents = $false
+
+  Write-Output "[Excel] opening workbook: $resolvedWorkbookPath"
+  $workbook = Invoke-ComRetry "open workbook" { $excel.Workbooks.Open($resolvedWorkbookPath) } 30 1000
+
+  Write-Output "[Excel] disabling background refresh..."
+  foreach ($connection in $workbook.Connections) {
+    try { $connection.OLEDBConnection.BackgroundQuery = $false } catch {}
+    try { $connection.ODBCConnection.BackgroundQuery = $false } catch {}
+  }
+
+  foreach ($worksheet in $workbook.Worksheets) {
+    foreach ($queryTable in $worksheet.QueryTables) {
+      try { $queryTable.BackgroundQuery = $false } catch {}
+    }
+    foreach ($listObject in $worksheet.ListObjects) {
+      try { $listObject.QueryTable.BackgroundQuery = $false } catch {}
+    }
+  }
+
+  Write-Output "[Excel] refreshing queries..."
+  Invoke-ComRetry "refresh queries" { $workbook.RefreshAll() } 30 1000 | Out-Null
+  Write-Output "[Excel] waiting 30 seconds for query refresh..."
+  Start-Sleep -Seconds 30
+  for ($attempt = 1; $attempt -le 30; $attempt += 1) {
+    try {
+      if ($excel.Ready) {
+        break
+      }
+    }
+    catch {}
+    Write-Output "[Excel] Excel is still busy; wait $attempt/30..."
+    Start-Sleep -Seconds 1
+  }
+  Write-Output "[Excel] saving workbook..."
+  Invoke-ComRetry "save workbook" { $workbook.Save() } 30 1000 | Out-Null
+  Write-Output "Excel refreshed and saved: $resolvedWorkbookPath"
+}
+finally {
+  if ($workbook -ne $null) {
+    try { $workbook.Close($true) } catch {}
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook) | Out-Null
+  }
+  if ($excel -ne $null) {
+    try { $excel.Quit() } catch {}
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
+  }
+  [GC]::Collect()
+  [GC]::WaitForPendingFinalizers()
+}
+`;
+
+  const powershell = 'powershell.exe';
+  return execFileAsync(
+    powershell,
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    { windowsHide: true, timeout: 5 * 60 * 1000 },
+  );
 }
 
 async function fetchWithRetry(url) {
@@ -170,8 +343,8 @@ async function main() {
   }
 
   // If we fell back to a different date, adjust the output filename
-  const finalOutput = process.argv[2]
-    ? resolve(SCRIPT_DIR, process.argv[2])
+  const finalOutput = OPTIONS.output
+    ? outputPathFromArgs()
     : resolve(SCRIPT_DIR, `twse-stocks-${usedDate}.csv`);
 
   const csvRows = [
@@ -208,6 +381,17 @@ async function main() {
     fields: stockTable.fields,
     encoding: 'UTF-8 with BOM',
   }, null, 2));
+
+  if (OPTIONS.refreshExcel) {
+    console.error(`Refreshing Excel workbook: ${OPTIONS.workbook}`);
+    const { stdout, stderr } = await refreshExcelWorkbook(OPTIONS.workbook);
+    if (stderr) {
+      console.error(stderr.trim());
+    }
+    if (stdout) {
+      console.error(stdout.trim());
+    }
+  }
 }
 
 main().catch((error) => {
